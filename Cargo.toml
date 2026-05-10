@@ -1,0 +1,12 @@
+[package]
+name = "mpo_tt_eval"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6.1", features = ["derive"] }
+half = "2"
+llama-gguf = { version = "0.14.0", default-features = false }
+nalgebra = { version = "0.34.2", default-features = false, features = ["std"] }
+ndarray = "0.17.2"
