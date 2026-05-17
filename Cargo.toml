@@ -2,9 +2,11 @@
 name = "mpo_tt_eval"
 version = "0.1.0"
 edition = "2021"
+default-run = "streamlayer"
 
 [dependencies]
 anyhow = "1"
+bytemuck = "1"
 clap = { version = "4.6.1", features = ["derive"] }
 half = "2"
 llama-gguf = { version = "0.14.0", default-features = false }

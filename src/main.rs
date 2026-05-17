@@ -611,6 +611,19 @@ fn dense_matvec(matrix: &[f32], rows: usize, cols: usize, vector: &[f32]) -> Res
     Ok(output.column(0).iter().copied().collect())
 }
 
+fn precompute_dense_outputs(
+    matrix: &[f32],
+    rows: usize,
+    cols: usize,
+    inputs: &[Vec<f32>],
+) -> Result<Vec<Vec<f32>>> {
+    let mut outputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        outputs.push(dense_matvec(matrix, rows, cols, input)?);
+    }
+    Ok(outputs)
+}
+
 fn matrix_to_row_major_vec(matrix: &DMatrix<f32>) -> Vec<f32> {
     let rows = matrix.nrows();
     let cols = matrix.ncols();
@@ -796,37 +809,42 @@ struct EvaluationSummary {
 }
 
 fn evaluate_inputs(
-    weights: &[f32],
-    rows: usize,
-    cols: usize,
     mpo: &MpoDecomposition,
     inputs: &[Vec<f32>],
+    dense_outputs: &[Vec<f32>],
 ) -> Result<EvaluationSummary> {
     if inputs.is_empty() {
         bail!("at least one input vector is required");
     }
-
-    let dense = ArrayView2::from_shape((rows, cols), weights)
-        .context("failed to view dense weight matrix")?;
+    if inputs.len() != dense_outputs.len() {
+        bail!(
+            "input/output count mismatch: got {} inputs and {} dense outputs",
+            inputs.len(),
+            dense_outputs.len()
+        );
+    }
 
     let mut sum = 0.0f64;
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
 
-    for input in inputs {
-        if input.len() != cols {
+    for (input, dense_output) in inputs.iter().zip(dense_outputs.iter()) {
+        if input.len() != mpo.cols {
             bail!(
                 "input vector length mismatch: got {}, expected {}",
                 input.len(),
-                cols
+                mpo.cols
             );
         }
-        let input_column = ArrayView2::from_shape((cols, 1), input.as_slice())
-            .context("failed to view input vector")?;
-        let dense_output = dense.dot(&input_column);
-        let dense_output = dense_output.column(0).iter().copied().collect::<Vec<_>>();
+        if dense_output.len() != mpo.rows {
+            bail!(
+                "dense output length mismatch: got {}, expected {}",
+                dense_output.len(),
+                mpo.rows
+            );
+        }
         let mpo_output = mpo.apply(input)?;
-        let cosine = cosine_similarity(&dense_output, &mpo_output);
+        let cosine = cosine_similarity(dense_output, &mpo_output);
         sum += cosine as f64;
         min = min.min(cosine);
         max = max.max(cosine);
@@ -919,6 +937,7 @@ fn run() -> Result<()> {
         );
         vectors
     };
+    let dense_outputs = precompute_dense_outputs(&tensor.values, tensor.rows, tensor.cols, &inputs)?;
 
     let dense_params = tensor.rows * tensor.cols;
     let mut best_passing_chi = None;
@@ -951,7 +970,7 @@ fn run() -> Result<()> {
             args.frob_samples,
             args.seed ^ (chi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
         );
-        let eval = evaluate_inputs(&tensor.values, tensor.rows, tensor.cols, &mpo, &inputs)?;
+        let eval = evaluate_inputs(&mpo, &inputs, &dense_outputs)?;
         let compression = mpo.compression_ratio();
         let verdict = if eval.mean_cosine >= 0.95 && eval.min_cosine >= 0.90 {
             if best_passing_chi.is_none() {
