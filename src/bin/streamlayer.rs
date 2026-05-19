@@ -1,18 +1,26 @@
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{pod_read_unaligned, Pod};
 use clap::Parser;
 use half::{bf16, f16};
 use llama_gguf::gguf::{GgmlType, GgufData, GgufFile, TensorInfo};
+use llama_gguf::tokenizer::Tokenizer;
 use llama_gguf::tensor::quant::{
     dequantize_q2_k, dequantize_q3_k, dequantize_q4_0, dequantize_q4_1, dequantize_q4_k,
     dequantize_q5_0, dequantize_q5_1, dequantize_q5_k, dequantize_q6_k, dequantize_q8_0,
     dequantize_q8_1, dequantize_q8_k, BlockQ2K, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ4K,
     BlockQ5_0, BlockQ5_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K,
 };
+use rayon::prelude::*;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,6 +54,12 @@ struct Args {
 
     #[arg(long)]
     trace_runtime: bool,
+
+    #[arg(long)]
+    prompt: Option<String>,
+
+    #[arg(long, default_value_t = 32)]
+    max_new_tokens: usize,
 
     #[arg(long, default_value_t = 0)]
     token_id: usize,
@@ -112,6 +126,13 @@ impl LayerTensorLayout {
         slots
     }
 
+    fn all_slots(&self) -> Vec<&TensorSlot> {
+        self.attention_slots()
+            .into_iter()
+            .chain(self.feed_forward_slots())
+            .collect()
+    }
+
     fn total_bytes(&self) -> usize {
         self.attention_slots()
             .into_iter()
@@ -127,6 +148,46 @@ impl LayerTensorLayout {
     fn feed_forward_bytes(&self) -> usize {
         self.feed_forward_slots().into_iter().map(|slot| slot.size).sum()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageKind {
+    Attention,
+    FeedForward,
+}
+
+impl StageKind {
+    fn label(self) -> &'static str {
+        match self {
+            StageKind::Attention => "attention",
+            StageKind::FeedForward => "ffn",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrefetchJob {
+    stage: StageKind,
+    layer_index: usize,
+    slots: Vec<TensorSlot>,
+    buffer: Vec<u8>,
+    trace: bool,
+}
+
+#[derive(Debug)]
+struct PrefetchResult {
+    stage: StageKind,
+    layer_index: usize,
+    bytes_written: usize,
+    buffer: Vec<u8>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct LayerTiming {
+    attention_compute_ms: f64,
+    ffn_compute_ms: f64,
+    prefetch_wait_ms: f64,
+    total_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +234,8 @@ struct StreamPlan {
     max_attention_block_bytes: usize,
     max_feed_forward_block_bytes: usize,
     max_layer_total_bytes: usize,
-    weight_buffer_bytes: usize,
+    attention_buffer_bytes: usize,
+    feed_forward_buffer_bytes: usize,
     kv_cache_bytes: usize,
     activation_scratch_bytes: usize,
     head_name: String,
@@ -193,10 +255,11 @@ type ModelPlan = StreamPlan;
 struct Runtime<'a> {
     file: Arc<GgufFile>,
     plan: &'a ModelPlan,
-    buf0: Vec<u8>,
-    buf1: Vec<u8>,
-    current_is_buf0: bool,
-    next_is_buf0: bool,
+    attention_buffer: Option<Vec<u8>>,
+    feed_forward_buffer: Option<Vec<u8>>,
+    prefetch_tx: mpsc::Sender<PrefetchJob>,
+    prefetch_rx: mpsc::Receiver<Result<PrefetchResult>>,
+    prefetch_worker: Option<JoinHandle<()>>,
     hidden: Vec<f32>,
     hidden_norm: Vec<f32>,
     q_buf: Vec<f32>,
@@ -215,7 +278,8 @@ struct Runtime<'a> {
 
 impl<'a> Runtime<'a> {
     fn new(file: Arc<GgufFile>, plan: &'a ModelPlan) -> Self {
-        let buffer_size = plan.weight_buffer_bytes.max(1);
+        let attention_buffer_size = plan.attention_buffer_bytes.max(1);
+        let feed_forward_buffer_size = plan.feed_forward_buffer_bytes.max(1);
         let hidden_size = plan.config.hidden_size;
         let kv_dim = plan.config.kv_dim;
         let feed_forward_size = plan.config.feed_forward_size;
@@ -224,13 +288,27 @@ impl<'a> Runtime<'a> {
             .layer_count
             .saturating_mul(plan.context_tokens)
             .saturating_mul(kv_dim);
+
+        let (prefetch_tx, prefetch_job_rx) = mpsc::channel::<PrefetchJob>();
+        let (prefetch_result_tx, prefetch_rx) = mpsc::channel::<Result<PrefetchResult>>();
+        let worker_file = Arc::clone(&file);
+        let prefetch_worker = thread::spawn(move || {
+            while let Ok(job) = prefetch_job_rx.recv() {
+                let result = prefetch_layer_into_buffer(worker_file.as_ref(), job);
+                if prefetch_result_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             file,
             plan,
-            buf0: vec![0u8; buffer_size],
-            buf1: vec![0u8; buffer_size],
-            current_is_buf0: true,
-            next_is_buf0: false,
+            attention_buffer: Some(vec![0u8; attention_buffer_size]),
+            feed_forward_buffer: Some(vec![0u8; feed_forward_buffer_size]),
+            prefetch_tx,
+            prefetch_rx,
+            prefetch_worker: Some(prefetch_worker),
             hidden: vec![0.0; hidden_size],
             hidden_norm: vec![0.0; hidden_size],
             q_buf: vec![0.0; hidden_size],
@@ -248,30 +326,32 @@ impl<'a> Runtime<'a> {
         }
     }
 
-    fn current_buffer_mut(&mut self) -> &mut [u8] {
-        if self.current_is_buf0 {
-            self.buf0.as_mut_slice()
-        } else {
-            self.buf1.as_mut_slice()
+    fn buffer_ref(&self, stage: StageKind) -> &[u8] {
+        match stage {
+            StageKind::Attention => self.attention_buffer.as_deref().expect("attention buffer missing"),
+            StageKind::FeedForward => self.feed_forward_buffer.as_deref().expect("FFN buffer missing"),
         }
     }
 
-    fn next_buffer_mut(&mut self) -> &mut [u8] {
-        if self.next_is_buf0 {
-            self.buf0.as_mut_slice()
-        } else {
-            self.buf1.as_mut_slice()
+    fn take_buffer(&mut self, stage: StageKind) -> Vec<u8> {
+        match stage {
+            StageKind::Attention => self.attention_buffer.take().expect("attention buffer missing"),
+            StageKind::FeedForward => self.feed_forward_buffer.take().expect("FFN buffer missing"),
         }
     }
 
-    fn swap_buffers(&mut self) {
-        std::mem::swap(&mut self.current_is_buf0, &mut self.next_is_buf0);
+    fn store_buffer(&mut self, stage: StageKind, buffer: Vec<u8>) {
+        match stage {
+            StageKind::Attention => self.attention_buffer = Some(buffer),
+            StageKind::FeedForward => self.feed_forward_buffer = Some(buffer),
+        }
     }
 
     fn trace_token(&mut self, token_id: usize) -> Result<()> {
         println!("Runtime trace");
         println!("  seed token id: {}", token_id);
-        println!("  double buffer size: {}", format_bytes(self.plan.weight_buffer_bytes));
+        println!("  attention buffer size: {}", format_bytes(self.plan.attention_buffer_bytes));
+        println!("  FFN buffer size: {}", format_bytes(self.plan.feed_forward_buffer_bytes));
         println!("  weight type: {}", self.plan.weight_type);
         println!();
 
@@ -286,74 +366,9 @@ impl<'a> Runtime<'a> {
         self.position = 0;
         println!("seed hidden rms: {:.4}", vector_rms(&self.hidden));
 
-        for layer_index in 0..self.plan.config.layer_count {
-            let layout = &self.plan.layer_layouts[layer_index];
-            println!("layer {layer_index}");
-
-            let attn_bytes = self.prefetch_layout(layout, true, true)?;
-            let current_buffer = if self.current_is_buf0 { "buf0" } else { "buf1" };
-            self.describe_layout("  attention", layout.attention_slots(), attn_bytes, current_buffer);
-
-            let attn_stage = if self.current_is_buf0 {
-                &self.buf0[..attn_bytes]
-            } else {
-                &self.buf1[..attn_bytes]
-            };
-            let mut scratch = LayerScratch {
-                hidden: &mut self.hidden,
-                hidden_norm: &mut self.hidden_norm,
-                q_buf: &mut self.q_buf,
-                k_buf: &mut self.k_buf,
-                v_buf: &mut self.v_buf,
-                attn_out_buf: &mut self.attn_out_buf,
-                ffn_gate_buf: &mut self.ffn_gate_buf,
-                ffn_up_buf: &mut self.ffn_up_buf,
-                ffn_out_buf: &mut self.ffn_out_buf,
-                row_buf: &mut self.row_buf,
-                scores_buf: &mut self.scores_buf,
-                kv_keys: &mut self.kv_keys,
-                kv_values: &mut self.kv_values,
-            };
-            let attn_stats = compute_attention_layer(
-                &self.plan.config,
-                layout,
-                attn_stage,
-                layer_index,
-                self.position,
-                &mut scratch,
-            )?;
-            println!("  compute attention: rms {:.4} -> {:.4}", attn_stats.input_rms, attn_stats.output_rms);
-
-            let ffn_bytes = self.prefetch_layout(layout, false, false)?;
-            let next_buffer = if self.next_is_buf0 { "buf1" } else { "buf0" };
-            self.describe_layout("  ffn", layout.feed_forward_slots(), ffn_bytes, next_buffer);
-
-            let ffn_stage = if self.next_is_buf0 {
-                &self.buf0[..ffn_bytes]
-            } else {
-                &self.buf1[..ffn_bytes]
-            };
-            let mut scratch = LayerScratch {
-                hidden: &mut self.hidden,
-                hidden_norm: &mut self.hidden_norm,
-                q_buf: &mut self.q_buf,
-                k_buf: &mut self.k_buf,
-                v_buf: &mut self.v_buf,
-                attn_out_buf: &mut self.attn_out_buf,
-                ffn_gate_buf: &mut self.ffn_gate_buf,
-                ffn_up_buf: &mut self.ffn_up_buf,
-                ffn_out_buf: &mut self.ffn_out_buf,
-                row_buf: &mut self.row_buf,
-                scores_buf: &mut self.scores_buf,
-                kv_keys: &mut self.kv_keys,
-                kv_values: &mut self.kv_values,
-            };
-            let ffn_stats = compute_ffn_layer(&self.plan.config, layout, ffn_stage, layer_index, &mut scratch)?;
-            println!("  compute ffn: rms {:.4} -> {:.4}", ffn_stats.input_rms, ffn_stats.output_rms);
-
-            self.swap_buffers();
-            println!("  swap -> next layer uses the freed buffer");
-        }
+        self.prefetch_stage_sync(0, StageKind::Attention)?;
+        self.prefetch_stage_sync(0, StageKind::FeedForward)?;
+        self.process_current_token(true)?;
 
         if let Some(final_norm) = find_final_norm_tensor(&self.file.data) {
             let input_rms = apply_final_norm(
@@ -371,6 +386,195 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
+    fn forward_token(&mut self, token_id: usize) -> Result<()> {
+        let token_embedding = self
+            .file
+            .data
+            .get_tensor("token_embd.weight")
+            .ok_or_else(|| anyhow!("missing token_embd.weight tensor"))?;
+        load_token_embedding(&self.file, token_embedding, token_id, &mut self.hidden, &mut self.row_buf)?;
+        self.prefetch_stage_sync(0, StageKind::Attention)?;
+        self.prefetch_stage_sync(0, StageKind::FeedForward)?;
+        self.process_current_token(false)?;
+        self.position += 1;
+        Ok(())
+    }
+
+    fn process_current_token(&mut self, trace: bool) -> Result<()> {
+        for layer_index in 0..self.plan.config.layer_count {
+            let layout = &self.plan.layer_layouts[layer_index];
+            if trace {
+                println!("layer {layer_index}");
+            }
+
+            let layer_started = Instant::now();
+            let attn_slots = layout.attention_slots();
+            let attn_stats = {
+                let attn_stage = self
+                    .attention_buffer
+                    .as_ref()
+                    .expect("attention buffer missing")
+                    .as_slice();
+                let mut scratch = LayerScratch {
+                    hidden: &mut self.hidden,
+                    hidden_norm: &mut self.hidden_norm,
+                    q_buf: &mut self.q_buf,
+                    k_buf: &mut self.k_buf,
+                    v_buf: &mut self.v_buf,
+                    attn_out_buf: &mut self.attn_out_buf,
+                    ffn_gate_buf: &mut self.ffn_gate_buf,
+                    ffn_up_buf: &mut self.ffn_up_buf,
+                    ffn_out_buf: &mut self.ffn_out_buf,
+                    row_buf: &mut self.row_buf,
+                    scores_buf: &mut self.scores_buf,
+                    kv_keys: &mut self.kv_keys,
+                    kv_values: &mut self.kv_values,
+                };
+                compute_attention_layer(&self.plan.config, &attn_slots, attn_stage, layer_index, self.position, &mut scratch)?
+            };
+            let attn_ms = layer_started.elapsed().as_secs_f64() * 1000.0;
+            let mut prefetch_wait_ms = 0.0;
+
+            if layer_index + 1 < self.plan.config.layer_count {
+                let next_layout = &self.plan.layer_layouts[layer_index + 1];
+                self.prefetch_stage_async(StageKind::Attention, layer_index + 1, next_layout.attention_slots().into_iter().cloned().collect(), trace)?;
+            }
+
+            if layer_index > 0 {
+                let wait_started = Instant::now();
+                let ffn_result = self.wait_for_prefetch()?;
+                prefetch_wait_ms += wait_started.elapsed().as_secs_f64() * 1000.0;
+                if trace {
+                    println!(
+                        "  prefetch {} layer {} complete: {} bytes",
+                        ffn_result.stage.label(),
+                        ffn_result.layer_index,
+                        ffn_result.bytes_written
+                    );
+                }
+                self.store_buffer(ffn_result.stage, ffn_result.buffer);
+            }
+
+            let ffn_slots = layout.feed_forward_slots();
+            let ffn_stats = {
+                let ffn_stage = self
+                    .feed_forward_buffer
+                    .as_ref()
+                    .expect("FFN buffer missing")
+                    .as_slice();
+                let mut scratch = LayerScratch {
+                    hidden: &mut self.hidden,
+                    hidden_norm: &mut self.hidden_norm,
+                    q_buf: &mut self.q_buf,
+                    k_buf: &mut self.k_buf,
+                    v_buf: &mut self.v_buf,
+                    attn_out_buf: &mut self.attn_out_buf,
+                    ffn_gate_buf: &mut self.ffn_gate_buf,
+                    ffn_up_buf: &mut self.ffn_up_buf,
+                    ffn_out_buf: &mut self.ffn_out_buf,
+                    row_buf: &mut self.row_buf,
+                    scores_buf: &mut self.scores_buf,
+                    kv_keys: &mut self.kv_keys,
+                    kv_values: &mut self.kv_values,
+                };
+                compute_ffn_layer(&self.plan.config, &ffn_slots, ffn_stage, layer_index, &mut scratch)?
+            };
+            let ffn_ms = layer_started.elapsed().as_secs_f64() * 1000.0 - attn_ms;
+
+            if layer_index + 1 < self.plan.config.layer_count {
+                let next_layout = &self.plan.layer_layouts[layer_index + 1];
+                self.prefetch_stage_async(StageKind::FeedForward, layer_index + 1, next_layout.feed_forward_slots().into_iter().cloned().collect(), trace)?;
+            }
+
+            if layer_index + 1 < self.plan.config.layer_count {
+                let wait_started = Instant::now();
+                let attn_result = self.wait_for_prefetch()?;
+                prefetch_wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+                if trace {
+                    println!(
+                        "  prefetch {} layer {} complete: {} bytes",
+                        attn_result.stage.label(),
+                        attn_result.layer_index,
+                        attn_result.bytes_written
+                    );
+                }
+                self.store_buffer(attn_result.stage, attn_result.buffer);
+            }
+
+            if trace {
+                println!("  compute attention: rms {:.4} -> {:.4}", attn_stats.input_rms, attn_stats.output_rms);
+                println!("  compute ffn: rms {:.4} -> {:.4}", ffn_stats.input_rms, ffn_stats.output_rms);
+                println!(
+                    "  layer timing: attention {:.2} ms, ffn {:.2} ms, prefetch wait {:.2} ms, total {:.2} ms",
+                    attn_ms,
+                    ffn_ms,
+                    prefetch_wait_ms,
+                    layer_started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prefetch_stage_sync(&mut self, layer_index: usize, stage: StageKind) -> Result<()> {
+        let layout = &self.plan.layer_layouts[layer_index];
+        let slots = match stage {
+            StageKind::Attention => layout.attention_slots(),
+            StageKind::FeedForward => layout.feed_forward_slots(),
+        };
+        let mut buffer = self.take_buffer(stage);
+        let bytes_written = copy_slots_into_buffer(self.file.as_ref(), &slots, buffer.as_mut_slice())?;
+        if bytes_written != buffer.len() {
+            // Stage buffers are sized to the maximum observed stage size, so partial fills are valid.
+        }
+        self.store_buffer(stage, buffer);
+        Ok(())
+    }
+
+    fn prefetch_stage_async(&mut self, stage: StageKind, layer_index: usize, slots: Vec<TensorSlot>, trace: bool) -> Result<()> {
+        let bytes = slots.iter().map(|slot| slot.size).sum::<usize>();
+        let buffer = self.take_buffer(stage);
+        if trace {
+            println!("  prefetch {} layer {}: {}", stage.label(), layer_index, format_bytes(bytes));
+        }
+        self.prefetch_tx
+            .send(PrefetchJob {
+                stage,
+                layer_index,
+                slots,
+                buffer,
+                trace,
+            })
+            .context("failed to submit prefetch job")
+    }
+
+    fn wait_for_prefetch(&mut self) -> Result<PrefetchResult> {
+        self.prefetch_rx
+            .recv()
+            .context("failed to receive prefetch result")?
+    }
+
+    fn predict_next_token(&mut self) -> Result<HeadComputeStats> {
+        if let Some(final_norm) = find_final_norm_tensor(&self.file.data) {
+            let _ = apply_final_norm(
+                &self.file,
+                final_norm,
+                &self.hidden,
+                &mut self.hidden_norm,
+                &mut self.row_buf,
+            )?;
+            self.hidden.copy_from_slice(&self.hidden_norm);
+        }
+
+        let head_info = self
+            .file
+            .data
+            .get_tensor(&self.plan.head_name)
+            .ok_or_else(|| anyhow!("missing head tensor {}", self.plan.head_name))?;
+        compute_head_argmax(&self.file, head_info, &self.hidden, &mut self.row_buf)
+    }
+
     fn load_global_tensors(&mut self) -> Result<()> {
         for slot in &self.plan.global_slots {
             println!("global load: {} ({})", slot.name, format_bytes(slot.size));
@@ -385,39 +589,6 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
-    fn prefetch_layout(
-        &mut self,
-        layout: &LayerTensorLayout,
-        is_attention: bool,
-        into_current: bool,
-    ) -> Result<usize> {
-        let slots = if is_attention {
-            layout.attention_slots()
-        } else {
-            layout.feed_forward_slots()
-        };
-        let file = Arc::clone(&self.file);
-        let buffer = if into_current {
-            self.current_buffer_mut()
-        } else {
-            self.next_buffer_mut()
-        };
-        let bytes_written = copy_slots_into_buffer(file.as_ref(), &slots, buffer)?;
-        let stage = if is_attention { "attention" } else { "ffn" };
-        println!(
-            "  prefetch {stage}: {} bytes into {}",
-            bytes_written,
-            if into_current {
-                if self.current_is_buf0 { "buf0" } else { "buf1" }
-            } else if self.next_is_buf0 {
-                "buf0"
-            } else {
-                "buf1"
-            }
-        );
-        Ok(bytes_written)
-    }
-
     fn describe_layout(&self, label: &str, slots: Vec<&TensorSlot>, bytes_written: usize, buffer_name: &str) {
         let total: usize = slots.iter().map(|slot| slot.size).sum();
         let names = slots
@@ -429,12 +600,7 @@ impl<'a> Runtime<'a> {
     }
 
     fn trace_head(&mut self) -> Result<()> {
-        let head_info = self
-            .file
-            .data
-            .get_tensor(&self.plan.head_name)
-            .ok_or_else(|| anyhow!("missing head tensor {}", self.plan.head_name))?;
-        let head_stats = compute_head_argmax(&self.file, head_info, &self.hidden, &mut self.row_buf)?;
+        let head_stats = self.predict_next_token()?;
 
         println!();
         println!("LM head: {} chunk(s) of {}", self.plan.head_chunk_count, format_bytes(self.plan.head_chunk_bytes));
@@ -447,6 +613,46 @@ impl<'a> Runtime<'a> {
 fn trace_runtime(file: &Arc<GgufFile>, plan: &ModelPlan, token_id: usize) -> Result<()> {
     let mut runtime = Runtime::new(Arc::clone(file), plan);
     runtime.trace_token(token_id)
+}
+
+fn run_prompt(file: &Arc<GgufFile>, plan: &ModelPlan, prompt: &str, max_new_tokens: usize, model_bytes: u64) -> Result<()> {
+    let tokenizer = Tokenizer::from_gguf(file.as_ref())?;
+    let prompt_tokens = tokenizer.encode(prompt, true)?;
+    let mut runtime = Runtime::new(Arc::clone(file), plan);
+
+    println!("Prompt run");
+    println!("  prompt: {}", prompt);
+    println!("  prompt tokens: {}", prompt_tokens.len());
+    println!("  model file size: {} bytes", model_bytes);
+    println!("  pipeline peak RAM estimate: {}", format_bytes(plan.peak_ram_bytes));
+    println!("  greedy generation: {} token(s)", max_new_tokens);
+    println!();
+
+    runtime.load_global_tensors()?;
+
+    let started = Instant::now();
+    for token_id in prompt_tokens.iter().copied() {
+        runtime.forward_token(token_id as usize)?;
+    }
+
+    let mut generated_tokens = Vec::with_capacity(max_new_tokens);
+    for _ in 0..max_new_tokens {
+        let head_stats = runtime.predict_next_token()?;
+        generated_tokens.push(head_stats.token_id as u32);
+        runtime.forward_token(head_stats.token_id)?;
+    }
+
+    let elapsed = started.elapsed();
+    let completion = tokenizer.decode(&generated_tokens)?;
+
+    println!("completion: {}", completion);
+    println!("generated tokens: {}", generated_tokens.len());
+    println!("elapsed: {:.3?}", elapsed);
+    if !generated_tokens.is_empty() {
+        let tokens_per_sec = generated_tokens.len() as f64 / elapsed.as_secs_f64();
+        println!("observed throughput: {:.2} tok/s", tokens_per_sec);
+    }
+    Ok(())
 }
 
 fn copy_slots_into_buffer(file: &GgufFile, slots: &[&TensorSlot], dst: &mut [u8]) -> Result<usize> {
@@ -466,6 +672,18 @@ fn copy_slots_into_buffer(file: &GgufFile, slots: &[&TensorSlot], dst: &mut [u8]
         cursor = end;
     }
     Ok(cursor)
+}
+
+fn prefetch_layer_into_buffer(file: &GgufFile, job: PrefetchJob) -> Result<PrefetchResult> {
+    let slot_refs = job.slots.iter().collect::<Vec<_>>();
+    let mut buffer = job.buffer;
+    let bytes_written = copy_slots_into_buffer(file, &slot_refs, buffer.as_mut_slice())?;
+    Ok(PrefetchResult {
+        stage: job.stage,
+        layer_index: job.layer_index,
+        bytes_written,
+        buffer,
+    })
 }
 
 fn stage_tensor_bytes<'a>(stage_bytes: &'a [u8], slots: &[&'a TensorSlot], name: &str) -> Result<(&'a TensorSlot, &'a [u8])> {
@@ -518,7 +736,8 @@ fn decode_tensor_row_from_file(file: &GgufFile, info: &TensorInfo, row_index: us
     decode_tensor_slice_to_f32(info.dtype, &data[start..end], out)
 }
 
-fn decode_stage_tensor_to_f32(stage_bytes: &[u8], slot: &TensorSlot, out: &mut [f32]) -> Result<()> {
+fn decode_stage_tensor_to_f32(stage_bytes: &[u8], slots: &[&TensorSlot], name: &str, out: &mut [f32]) -> Result<()> {
+    let (slot, bytes) = stage_tensor_bytes(stage_bytes, slots, name)?;
     let expected = slot.rows * slot.cols;
     if out.len() != expected {
         bail!(
@@ -528,7 +747,7 @@ fn decode_stage_tensor_to_f32(stage_bytes: &[u8], slot: &TensorSlot, out: &mut [
             out.len()
         );
     }
-    decode_tensor_slice_to_f32(slot.dtype, stage_bytes, out)
+    decode_tensor_slice_to_f32(slot.dtype, bytes, out)
 }
 
 fn matmul_tensor_slot(
@@ -579,15 +798,106 @@ fn matmul_tensor_slot(
         );
     }
 
-    for row_index in 0..slot.rows {
-        let row_start = row_index * row_bytes;
-        let row_end = row_start + row_bytes;
-        let row_output = &mut row_buf[..slot.cols];
-        decode_tensor_slice_to_f32(slot.dtype, &bytes[row_start..row_end], row_output)?;
-        output[row_index] = dot_product(row_output, input);
+    let use_parallel = slot.rows >= 128 && rayon::current_num_threads() > 1;
+    if use_parallel {
+        let worker_count = rayon::current_num_threads().max(1);
+        let chunk_rows = (slot.rows + worker_count - 1) / worker_count;
+        output
+            .par_chunks_mut(chunk_rows)
+            .enumerate()
+            .try_for_each(|(chunk_index, out_chunk)| -> Result<()> {
+                let mut local_row_buf = vec![0.0f32; slot.cols];
+                let first_row = chunk_index * chunk_rows;
+                for (offset, out_cell) in out_chunk.iter_mut().enumerate() {
+                    let row_index = first_row + offset;
+                    let row_start = row_index * row_bytes;
+                    let row_end = row_start + row_bytes;
+                    *out_cell = matmul_row(slot.dtype, &bytes[row_start..row_end], input, &mut local_row_buf)?;
+                }
+                Ok(())
+            })?;
+    } else {
+        for row_index in 0..slot.rows {
+            let row_start = row_index * row_bytes;
+            let row_end = row_start + row_bytes;
+            output[row_index] = matmul_row(slot.dtype, &bytes[row_start..row_end], input, row_buf)?;
+        }
     }
 
     Ok(())
+}
+
+fn matmul_row(dtype: GgmlType, bytes: &[u8], input: &[f32], row_buf: &mut [f32]) -> Result<f32> {
+    match dtype {
+        GgmlType::F32
+        | GgmlType::F16
+        | GgmlType::BF16
+        | GgmlType::I8
+        | GgmlType::I16
+        | GgmlType::I32
+        | GgmlType::I64
+        | GgmlType::F64 => {
+            if row_buf.len() < input.len() {
+                bail!("row buffer too small for matmul row: need {}, have {}", input.len(), row_buf.len());
+            }
+            decode_tensor_slice_to_f32(dtype, bytes, &mut row_buf[..input.len()])?;
+            Ok(dot_product(&row_buf[..input.len()], input))
+        }
+        GgmlType::Q4_0 => matmul_quantized_row::<BlockQ4_0, 32, _>(bytes, input, dequantize_q4_0),
+        GgmlType::Q4_1 => matmul_quantized_row::<BlockQ4_1, 32, _>(bytes, input, dequantize_q4_1),
+        GgmlType::Q5_0 => matmul_quantized_row::<BlockQ5_0, 32, _>(bytes, input, dequantize_q5_0),
+        GgmlType::Q5_1 => matmul_quantized_row::<BlockQ5_1, 32, _>(bytes, input, dequantize_q5_1),
+        GgmlType::Q8_0 => matmul_quantized_row::<BlockQ8_0, 32, _>(bytes, input, dequantize_q8_0),
+        GgmlType::Q8_1 => matmul_quantized_row::<BlockQ8_1, 32, _>(bytes, input, dequantize_q8_1),
+        GgmlType::Q2K => matmul_quantized_row::<BlockQ2K, 256, _>(bytes, input, dequantize_q2_k),
+        GgmlType::Q3K => matmul_quantized_row::<BlockQ3K, 256, _>(bytes, input, dequantize_q3_k),
+        GgmlType::Q4K => matmul_quantized_row::<BlockQ4K, 256, _>(bytes, input, dequantize_q4_k),
+        GgmlType::Q5K => matmul_quantized_row::<BlockQ5K, 256, _>(bytes, input, dequantize_q5_k),
+        GgmlType::Q6K => matmul_quantized_row::<BlockQ6K, 256, _>(bytes, input, dequantize_q6_k),
+        GgmlType::Q8K => matmul_quantized_row::<BlockQ8K, 256, _>(bytes, input, dequantize_q8_k),
+        other => bail!("unsupported tensor dtype {:?} for matmul", other),
+    }
+}
+
+fn matmul_quantized_row<T, const BLOCK_SIZE: usize, F>(
+    bytes: &[u8],
+    input: &[f32],
+    mut dequantize: F,
+) -> Result<f32>
+where
+    T: Pod,
+    F: FnMut(&T, &mut [f32; BLOCK_SIZE]),
+{
+    if input.len() % BLOCK_SIZE != 0 {
+        bail!(
+            "input length {} is not divisible by block size {}",
+            input.len(),
+            BLOCK_SIZE
+        );
+    }
+
+    let block_count = input.len() / BLOCK_SIZE;
+    let expected_bytes = block_count * size_of::<T>();
+    if bytes.len() != expected_bytes {
+        bail!(
+            "quantized row length mismatch: expected {} bytes, got {}",
+            expected_bytes,
+            bytes.len()
+        );
+    }
+
+    let mut block_out = [0.0f32; BLOCK_SIZE];
+    let mut acc = 0.0f32;
+    for block_index in 0..block_count {
+        let start = block_index * size_of::<T>();
+        let end = start + size_of::<T>();
+        let block: T = pod_read_unaligned(&bytes[start..end]);
+        dequantize(&block, &mut block_out);
+        let input_start = block_index * BLOCK_SIZE;
+        acc += dot_product(&block_out, &input[input_start..input_start + BLOCK_SIZE]);
+    }
+
+    Ok(acc)
 }
 
 fn find_final_norm_tensor(data: &GgufData) -> Option<&TensorInfo> {
@@ -660,7 +970,7 @@ fn apply_final_norm(
 
 fn compute_attention_layer(
     config: &ModelConfig,
-    layout: &LayerTensorLayout,
+    attn_slots: &[&TensorSlot],
     stage_bytes: &[u8],
     layer_index: usize,
     position: usize,
@@ -675,12 +985,11 @@ fn compute_attention_layer(
     }
 
     let input_rms = vector_rms(scratch.hidden);
-    let attn_slots = layout.attention_slots();
     let attn_norm_slot = attn_slots
         .iter()
         .find(|slot| slot.name.contains("attn_norm"))
         .ok_or_else(|| anyhow!("missing attention norm tensor for layer {}", layer_index))?;
-    decode_stage_tensor_to_f32(stage_bytes, attn_norm_slot, &mut scratch.row_buf[..hidden_size])?;
+    decode_stage_tensor_to_f32(stage_bytes, attn_slots, &attn_norm_slot.name, &mut scratch.row_buf[..hidden_size])?;
     rms_norm(scratch.hidden, &scratch.row_buf[..hidden_size], scratch.hidden_norm)?;
 
     let attn_q_slot = attn_slots
@@ -700,9 +1009,9 @@ fn compute_attention_layer(
         .find(|slot| slot.name.contains("attn_output"))
         .ok_or_else(|| anyhow!("missing attention output tensor for layer {}", layer_index))?;
 
-    matmul_tensor_slot(stage_bytes, &attn_slots, &attn_q_slot.name, scratch.hidden_norm, scratch.q_buf, scratch.row_buf)?;
-    matmul_tensor_slot(stage_bytes, &attn_slots, &attn_k_slot.name, scratch.hidden_norm, scratch.k_buf, scratch.row_buf)?;
-    matmul_tensor_slot(stage_bytes, &attn_slots, &attn_v_slot.name, scratch.hidden_norm, scratch.v_buf, scratch.row_buf)?;
+    matmul_tensor_slot(stage_bytes, attn_slots, &attn_q_slot.name, scratch.hidden_norm, scratch.q_buf, scratch.row_buf)?;
+    matmul_tensor_slot(stage_bytes, attn_slots, &attn_k_slot.name, scratch.hidden_norm, scratch.k_buf, scratch.row_buf)?;
+    matmul_tensor_slot(stage_bytes, attn_slots, &attn_v_slot.name, scratch.hidden_norm, scratch.v_buf, scratch.row_buf)?;
 
     let cache_layer_base = (layer_index * scratch.scores_buf.len().max(1)).saturating_mul(kv_dim);
     if position >= scratch.scores_buf.len() {
@@ -756,14 +1065,7 @@ fn compute_attention_layer(
         }
     }
 
-    matmul_tensor_slot(
-        stage_bytes,
-        &attn_slots,
-        &attn_o_slot.name,
-        scratch.attn_out_buf,
-        scratch.hidden_norm,
-        scratch.row_buf,
-    )?;
+    matmul_tensor_slot(stage_bytes, attn_slots, &attn_o_slot.name, scratch.attn_out_buf, scratch.hidden_norm, scratch.row_buf)?;
     apply_residual(scratch.hidden, scratch.hidden_norm)?;
 
     Ok(LayerComputeStats {
@@ -774,7 +1076,7 @@ fn compute_attention_layer(
 
 fn compute_ffn_layer(
     config: &ModelConfig,
-    layout: &LayerTensorLayout,
+    ffn_slots: &[&TensorSlot],
     stage_bytes: &[u8],
     layer_index: usize,
     scratch: &mut LayerScratch<'_>,
@@ -783,12 +1085,11 @@ fn compute_ffn_layer(
     let ffn_size = config.feed_forward_size;
 
     let input_rms = vector_rms(scratch.hidden);
-    let ffn_slots = layout.feed_forward_slots();
     let ffn_norm_slot = ffn_slots
         .iter()
         .find(|slot| slot.name.contains("ffn_norm"))
         .ok_or_else(|| anyhow!("missing FFN norm tensor for layer {}", layer_index))?;
-    decode_stage_tensor_to_f32(stage_bytes, ffn_norm_slot, &mut scratch.row_buf[..hidden_size])?;
+    decode_stage_tensor_to_f32(stage_bytes, ffn_slots, &ffn_norm_slot.name, &mut scratch.row_buf[..hidden_size])?;
     rms_norm(scratch.hidden, &scratch.row_buf[..hidden_size], scratch.hidden_norm)?;
 
     let ffn_gate_slot = ffn_slots
@@ -804,8 +1105,8 @@ fn compute_ffn_layer(
         .find(|slot| slot.name.contains("ffn_down"))
         .ok_or_else(|| anyhow!("missing FFN down tensor for layer {}", layer_index))?;
 
-    matmul_tensor_slot(stage_bytes, &ffn_slots, &ffn_gate_slot.name, scratch.hidden_norm, scratch.ffn_gate_buf, scratch.row_buf)?;
-    matmul_tensor_slot(stage_bytes, &ffn_slots, &ffn_up_slot.name, scratch.hidden_norm, scratch.ffn_up_buf, scratch.row_buf)?;
+    matmul_tensor_slot(stage_bytes, ffn_slots, &ffn_gate_slot.name, scratch.hidden_norm, scratch.ffn_gate_buf, scratch.row_buf)?;
+    matmul_tensor_slot(stage_bytes, ffn_slots, &ffn_up_slot.name, scratch.hidden_norm, scratch.ffn_up_buf, scratch.row_buf)?;
 
     if scratch.ffn_gate_buf.len() < ffn_size || scratch.ffn_up_buf.len() < ffn_size {
         bail!("FFN scratch buffers are too small for layer {}", layer_index);
@@ -815,14 +1116,7 @@ fn compute_ffn_layer(
         scratch.ffn_gate_buf[index] *= scratch.ffn_up_buf[index];
     }
 
-    matmul_tensor_slot(
-        stage_bytes,
-        &ffn_slots,
-        &ffn_down_slot.name,
-        &scratch.ffn_gate_buf[..ffn_size],
-        &mut scratch.ffn_out_buf[..hidden_size],
-        scratch.row_buf,
-    )?;
+    matmul_tensor_slot(stage_bytes, ffn_slots, &ffn_down_slot.name, &scratch.ffn_gate_buf[..ffn_size], &mut scratch.ffn_out_buf[..hidden_size], scratch.row_buf)?;
     apply_residual(scratch.hidden, &scratch.ffn_out_buf[..hidden_size])?;
 
     Ok(LayerComputeStats {
@@ -866,18 +1160,48 @@ fn compute_head_argmax(
         );
     }
 
-    let mut best_token_id = 0usize;
-    let mut best_logit = f32::NEG_INFINITY;
-    for row_index in 0..rows {
-        let row_start = row_index * row_bytes;
-        let row_end = row_start + row_bytes;
-        decode_tensor_slice_to_f32(head_info.dtype, &data[row_start..row_end], &mut row_buf[..cols])?;
-        let logit = dot_product(&row_buf[..cols], input);
-        if logit > best_logit {
-            best_logit = logit;
-            best_token_id = row_index;
+    let use_parallel = rows >= 128 && rayon::current_num_threads() > 1;
+    let (best_token_id, best_logit) = if use_parallel {
+        let worker_count = rayon::current_num_threads().max(1);
+        let chunk_rows = (rows + worker_count - 1) / worker_count;
+        data.par_chunks(row_bytes * chunk_rows)
+            .enumerate()
+            .map(|(chunk_index, chunk)| -> Result<(usize, f32)> {
+                let mut local_row_buf = vec![0.0f32; cols];
+                let mut local_best_token_id = chunk_index * chunk_rows;
+                let mut local_best_logit = f32::NEG_INFINITY;
+                let row_count = chunk.len() / row_bytes;
+                for row_offset in 0..row_count {
+                    let row_start = row_offset * row_bytes;
+                    let row_end = row_start + row_bytes;
+                    decode_tensor_slice_to_f32(head_info.dtype, &chunk[row_start..row_end], &mut local_row_buf[..cols])?;
+                    let logit = dot_product(&local_row_buf[..cols], input);
+                    if logit > local_best_logit {
+                        local_best_logit = logit;
+                        local_best_token_id = chunk_index * chunk_rows + row_offset;
+                    }
+                }
+                Ok((local_best_token_id, local_best_logit))
+            })
+            .try_reduce(
+                || (0usize, f32::NEG_INFINITY),
+                |left, right| Ok(if left.1 >= right.1 { left } else { right }),
+            )?
+    } else {
+        let mut best_token_id = 0usize;
+        let mut best_logit = f32::NEG_INFINITY;
+        for row_index in 0..rows {
+            let row_start = row_index * row_bytes;
+            let row_end = row_start + row_bytes;
+            decode_tensor_slice_to_f32(head_info.dtype, &data[row_start..row_end], &mut row_buf[..cols])?;
+            let logit = dot_product(&row_buf[..cols], input);
+            if logit > best_logit {
+                best_logit = logit;
+                best_token_id = row_index;
+            }
         }
-    }
+        (best_token_id, best_logit)
+    };
 
     Ok(HeadComputeStats {
         token_id: best_token_id,
@@ -912,6 +1236,15 @@ fn run() -> Result<()> {
             .with_context(|| format!("failed to open GGUF file {}", args.gguf.display()))?,
     );
     let plan = build_plan(&file.data, args.context_tokens, args.head_chunk_mb, args.activation_scratch_mb, args.nvme_gbps, args.cpu_gflops)?;
+
+    let model_bytes = std::fs::metadata(&args.gguf)
+        .with_context(|| format!("failed to stat GGUF file {}", args.gguf.display()))?
+        .len();
+
+    if let Some(prompt) = args.prompt.as_deref() {
+        run_prompt(&file, &plan, prompt, args.max_new_tokens, model_bytes)?;
+        return Ok(());
+    }
 
     if args.trace_runtime {
         trace_runtime(&file, &plan, args.token_id)?;
@@ -996,7 +1329,8 @@ fn build_plan(
         .max()
         .unwrap_or(0);
 
-    let weight_buffer_bytes = max_attention_block_bytes.max(max_feed_forward_block_bytes);
+    let attention_buffer_bytes = max_attention_block_bytes;
+    let feed_forward_buffer_bytes = max_feed_forward_block_bytes;
     let kv_cache_bytes = estimate_kv_cache_bytes(&config, context_tokens);
     let activation_scratch_bytes = activation_scratch_mb * mb();
 
@@ -1010,7 +1344,8 @@ fn build_plan(
     let head_chunk_count = ceil_div(head_bytes.max(1), head_chunk_bytes);
 
     let estimated_layer_compute_ms = estimate_layer_compute_ms(&config, context_tokens, cpu_gflops);
-    let estimated_layer_io_ms = bytes_to_ms(weight_buffer_bytes, nvme_gbps);
+    let estimated_layer_io_ms = bytes_to_ms(attention_buffer_bytes, nvme_gbps)
+        + bytes_to_ms(feed_forward_buffer_bytes, nvme_gbps);
     let estimated_head_latency_ms = max_duration_ms(
         bytes_to_ms(head_bytes, nvme_gbps),
         estimate_head_compute_ms(head_info, cpu_gflops),
@@ -1023,7 +1358,8 @@ fn build_plan(
         0.0
     };
 
-    let peak_ram_bytes = 2 * weight_buffer_bytes
+    let peak_ram_bytes = attention_buffer_bytes
+        + feed_forward_buffer_bytes
         + kv_cache_bytes
         + activation_scratch_bytes
         + head_chunk_bytes;
@@ -1039,7 +1375,8 @@ fn build_plan(
         max_attention_block_bytes,
         max_feed_forward_block_bytes,
         max_layer_total_bytes,
-        weight_buffer_bytes,
+        attention_buffer_bytes,
+        feed_forward_buffer_bytes,
         kv_cache_bytes,
         activation_scratch_bytes,
         head_name: head_info.name.clone(),
@@ -1388,7 +1725,42 @@ fn decode_tensor_slice_to_f32(dtype: GgmlType, bytes: &[u8], out: &mut [f32]) ->
 }
 
 fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { dot_product_avx2(lhs, rhs) };
+        }
+    }
+    dot_product_scalar(lhs, rhs)
+}
+
+fn dot_product_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
     lhs.iter().zip(rhs.iter()).map(|(left, right)| left * right).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_product_avx2(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let mut index = 0usize;
+    let len = lhs.len().min(rhs.len());
+    let mut acc = _mm256_setzero_ps();
+
+    while index + 8 <= len {
+        let left = _mm256_loadu_ps(lhs.as_ptr().add(index));
+        let right = _mm256_loadu_ps(rhs.as_ptr().add(index));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(left, right));
+        index += 8;
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    while index < len {
+        sum += lhs[index] * rhs[index];
+        index += 1;
+    }
+    sum
 }
 
 fn rms_norm(input: &[f32], weight: &[f32], output: &mut [f32]) -> Result<f32> {
@@ -1487,7 +1859,8 @@ fn print_plan(plan: &StreamPlan, peak_budget_mb: usize, show_tensor_names: bool)
     println!("  max attention block: {}", format_bytes(plan.max_attention_block_bytes));
     println!("  max FFN block:       {}", format_bytes(plan.max_feed_forward_block_bytes));
     println!("  max whole layer:     {}", format_bytes(plan.max_layer_total_bytes));
-    println!("  double-buffered weights: {}", format_bytes(2 * plan.weight_buffer_bytes));
+    println!("  attention buffer:    {}", format_bytes(plan.attention_buffer_bytes));
+    println!("  FFN buffer:          {}", format_bytes(plan.feed_forward_buffer_bytes));
     println!("  KV cache ({} tok):   {}", plan.context_tokens, format_bytes(plan.kv_cache_bytes));
     println!("  activations/scratch:  {}", format_bytes(plan.activation_scratch_bytes));
     println!("  head chunk buffer:    {}", format_bytes(plan.head_chunk_bytes));
@@ -1515,10 +1888,10 @@ fn print_plan(plan: &StreamPlan, peak_budget_mb: usize, show_tensor_names: bool)
 
     println!("Scheduler outline:");
     println!("  1. mmap the GGUF file and index tensor offsets by layer.");
-    println!("  2. Allocate two buffers of size {}.", format_bytes(plan.weight_buffer_bytes));
-    println!("  3. Prefetch layer 0 attention into buffer A.");
-    println!("  4. For each layer, overlap next-layer attention prefetch with current-layer compute.");
-    println!("  5. Load the FFN block after attention, reusing the same buffer pair.");
+    println!("  2. Allocate an attention buffer of {} and an FFN buffer of {}.", format_bytes(plan.attention_buffer_bytes), format_bytes(plan.feed_forward_buffer_bytes));
+    println!("  3. Prefetch layer 0 attention and FFN before starting.");
+    println!("  4. For each layer, overlap next-layer attention prefetch with current-layer FFN compute.");
+    println!("  5. Prefetch the next FFN block after attention, reusing the FFN buffer.");
     println!("  6. Stream the LM head in {} chunk(s) of at most {}.", plan.head_chunk_count, format_bytes(plan.head_chunk_bytes));
     println!();
 }

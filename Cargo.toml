@@ -12,3 +12,4 @@ half = "2"
 llama-gguf = { version = "0.14.0", default-features = false }
 nalgebra = { version = "0.34.2", default-features = false, features = ["std"] }
 ndarray = "0.17.2"
+rayon = "1"

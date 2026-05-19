@@ -589,6 +589,7 @@ dependencies = [
  "llama-gguf",
  "nalgebra",
  "ndarray",
+ "rayon",
 ]
 
 [[package]]
